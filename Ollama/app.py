@@ -8,6 +8,8 @@ import datetime
 from urllib.parse import urlencode
 from dateutil.relativedelta import relativedelta
 import re
+import subprocess
+import json
 
 # ==============================
 # 1) Load Config
@@ -113,6 +115,61 @@ def parse_date_range(user_text: str):
 def iso_utc(dt: datetime.datetime) -> str:
     return dt.replace(microsecond=0).isoformat() + "Z"
 
+
+def extract_date_range_with_ollama(user_prompt: str):
+    """
+    Uses Ollama (llama3 or similar) to extract a start and end date from the user's natural prompt.
+    """
+    system_prompt = f"""
+You are a date extraction assistant.
+The current date is {datetime.date.today()}.
+Extract the start_date and end_date from the user prompt below.
+If the prompt is vague like "next week" or "this month", infer the exact date range.
+Return the result ONLY in strict JSON with keys: start_date, end_date, description.
+Example output:
+{{"start_date": "2025-10-01", "end_date": "2025-10-07", "description": "Next week"}}
+User prompt: "{user_prompt}"
+"""
+
+    process = subprocess.Popen(
+        ["ollama", "run", "llama3"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    output, _ = process.communicate(system_prompt)
+
+    # Try to find a JSON object using regex
+    try:
+        match = re.search(r"\{[\s\S]*\}", output)
+        if not match:
+            raise ValueError("No JSON object found in output.")
+
+        json_str = match.group(0).strip()
+
+        # Attempt to load JSON
+        data = json.loads(json_str)
+
+        # Basic validation
+        for key in ["start_date", "end_date", "description"]:
+            if key not in data:
+                raise ValueError(f"Missing key: {key}")
+
+        return data
+
+    except Exception as e:
+        return {
+            "error": f"Could not parse dates: {e}",
+            "raw_output": output.strip()
+        }
+
+# def handle_date_extraction(date_info):
+#     if "error" in date_info:
+#         return f"❌ {date_info['error']}\n\nRaw Output: {date_info['raw_output']}"
+#     return date_info        
+
 def fetch_user_events(user_id, token, start_date, end_date):
 
     url = (
@@ -183,16 +240,24 @@ if "chat_history" not in st.session_state:
 if submit and text:
     with st.spinner("Fetching and summarizing..."):
         token = get_app_token()
-
+        
         # 🔥 Parse user’s request for dynamic period
-        start_date, end_date, period_desc = parse_date_range(text)
+        date_info = extract_date_range_with_ollama(text)
 
-        # Fetch events dynamically
-        events = fetch_user_events(USER_ID, token, start_date, end_date)
-        shaped = shape_events(events)
-        summary = summarize_events(shaped, period_desc)
-        st.session_state['chat_history'].append({"user": text, "ollama": summary})
-        st.write(summary)
+        
+        if "error" in date_info:
+            st.write(f"❌ {date_info['error']}\nRaw Output:\n{date_info['raw_output']}")
+        else:
+            start_date = datetime.datetime.fromisoformat(date_info["start_date"])
+            end_date = datetime.datetime.fromisoformat(date_info["end_date"])
+            period_desc = date_info["description"]
+
+            # Fetch events dynamically
+            events = fetch_user_events(USER_ID, token, start_date, end_date)
+            shaped = shape_events(events)
+            summary = summarize_events(shaped, period_desc)
+            st.session_state['chat_history'].append({"user": text, "ollama": summary})
+            st.write(summary)
 
 st.write("## Chat History")
 for chat in reversed(st.session_state['chat_history']):
